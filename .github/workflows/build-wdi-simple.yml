@@ -43,23 +43,25 @@ jobs:
           Write-Host "========================================"
           Write-Host "Downloading dependencies"
           Write-Host "========================================"
-          Write-Host ""
 
           # --------------------------------------------------------
           # Download
           # --------------------------------------------------------
 
           Write-Host "Downloading WDK redistributable..."
+
           Invoke-WebRequest `
             -Uri $env:WDK_URL `
             -OutFile wdk-redist.msi
 
           Write-Host "Downloading libusb-win32..."
+
           Invoke-WebRequest `
             -Uri $env:LIBUSB0_URL `
             -OutFile libusb0-redist.zip
 
           Write-Host "Downloading libusbK..."
+
           Invoke-WebRequest `
             -Uri $env:LIBUSBK_URL `
             -OutFile libusbk-redist.7z
@@ -67,9 +69,6 @@ jobs:
           # --------------------------------------------------------
           # Create extraction directories
           # --------------------------------------------------------
-
-          Write-Host ""
-          Write-Host "Creating extraction directories..."
 
           New-Item -ItemType Directory -Force -Path wdk | Out-Null
           New-Item -ItemType Directory -Force -Path libusb0-archive | Out-Null
@@ -115,7 +114,7 @@ jobs:
           Write-Host ""
           Write-Host "Extracting libusbK..."
 
-          7z x libusbk-redist.7z -olibusk-archive -y
+          7z x libusbk-redist.7z -olibusbk-archive -y
 
           # --------------------------------------------------------
           # Normalize libusb-win32
@@ -137,30 +136,30 @@ jobs:
             Remove-Item libusb0 -Recurse -Force
           }
 
-          Move-Item $libusb0Root.FullName libusb0
+          Move-Item `
+            $libusb0Root.FullName `
+            libusb0
 
           # --------------------------------------------------------
-          # Locate libusbK.sys
+          # Locate libusbK.sys WITHOUT assuming its exact directory
           # --------------------------------------------------------
 
           Write-Host ""
           Write-Host "Searching for libusbK.sys..."
 
-          $libusbKFile = Get-ChildItem `
+          $libusbKFiles = Get-ChildItem `
             -Path libusbk-archive `
             -Filter libusbK.sys `
             -File `
-            -Recurse |
-            Where-Object {
-              $_.FullName -match '[\\/]bin[\\/]sys[\\/]x86[\\/]libusbK\.sys$'
-            } |
-            Select-Object -First 1
+            -Recurse
 
-          if (-not $libusbKFile) {
+          if (-not $libusbKFiles) {
+
+            Write-Host ""
+            Write-Host "ERROR: libusbK.sys was not found."
 
             Write-Host ""
             Write-Host "Files contained in libusbK archive:"
-            Write-Host ""
 
             Get-ChildItem `
               -Path libusbk-archive `
@@ -168,107 +167,249 @@ jobs:
               -File |
               Select-Object -ExpandProperty FullName
 
-            throw "The libusbK archive does not contain bin/sys/x86/libusbK.sys"
+            throw "libusbK.sys not found in libusbK archive."
           }
 
           Write-Host ""
-          Write-Host "Found libusbK.sys:"
-          Write-Host $libusbKFile.FullName
+          Write-Host "Found libusbK.sys files:"
+
+          foreach ($file in $libusbKFiles) {
+            Write-Host $file.FullName
+          }
 
           # --------------------------------------------------------
-          # Find the actual libusbK root.
+          # Locate architecture-specific driver files
+          # --------------------------------------------------------
+
+          $x86Sys = $libusbKFiles |
+            Where-Object {
+              $_.FullName -match '[\\/]x86[\\/][^\\/]*libusbK\.sys$'
+            } |
+            Select-Object -First 1
+
+          $amd64Sys = $libusbKFiles |
+            Where-Object {
+              $_.FullName -match '[\\/](amd64|x64)[\\/][^\\/]*libusbK\.sys$'
+            } |
+            Select-Object -First 1
+
+          if (-not $x86Sys) {
+            Write-Warning "Could not identify an x86-specific libusbK.sys."
+          }
+
+          if (-not $amd64Sys) {
+            Write-Warning "Could not identify an amd64-specific libusbK.sys."
+          }
+
+          # --------------------------------------------------------
+          # Find libusbK DLLs
+          # --------------------------------------------------------
+
+          Write-Host ""
+          Write-Host "Searching for libusbK.dll..."
+
+          $libusbKDlls = Get-ChildItem `
+            -Path libusbk-archive `
+            -Filter libusbK.dll `
+            -File `
+            -Recurse
+
+          foreach ($dll in $libusbKDlls) {
+            Write-Host $dll.FullName
+          }
+
+          # --------------------------------------------------------
+          # Build normalized libusbK tree
           #
-          # We intentionally DO NOT assume a fixed number of
-          # parent directories.
+          # libwdi expects:
           #
-          # Expected structure:
-          #
-          # <root>\
+          # libusbk\
           #   bin\
           #     sys\
           #       x86\
           #         libusbK.sys
-          #
+          #       amd64\
+          #         libusbK.sys
+          #     dll\
+          #       x86\
+          #         libusbK.dll
+          #       amd64\
+          #         libusbK.dll
           # --------------------------------------------------------
 
           Write-Host ""
-          Write-Host "Locating libusbK root..."
-
-          $libusbKRoot = Get-ChildItem `
-            -Path libusbk-archive `
-            -Directory `
-            -Recurse |
-            Where-Object {
-              Test-Path (
-                Join-Path $_.FullName 'bin\sys\x86\libusbK.sys'
-              )
-            } |
-            Select-Object -First 1
-
-          if (-not $libusbKRoot) {
-            throw "Could not determine the libusbK root directory"
-          }
-
-          Write-Host ""
-          Write-Host "libusbK root:"
-          Write-Host $libusbKRoot.FullName
-
-          # --------------------------------------------------------
-          # Validate expected structure
-          # --------------------------------------------------------
-
-          $expectedSource = Join-Path `
-            $libusbKRoot.FullName `
-            'bin\sys\x86\libusbK.sys'
-
-          if (-not (Test-Path $expectedSource)) {
-            throw "Invalid libusbK root: $($libusbKRoot.FullName)"
-          }
-
-          Write-Host ""
-          Write-Host "Validated:"
-          Write-Host $expectedSource
-
-          # --------------------------------------------------------
-          # Normalize libusbK directory
-          # --------------------------------------------------------
+          Write-Host "Creating normalized libusbK directory..."
 
           if (Test-Path libusbk) {
             Remove-Item libusbk -Recurse -Force
           }
 
-          Move-Item `
-            $libusbKRoot.FullName `
-            libusbk
+          New-Item -ItemType Directory -Force -Path `
+            "libusbk\bin\sys\x86" | Out-Null
+
+          New-Item -ItemType Directory -Force -Path `
+            "libusbk\bin\sys\amd64" | Out-Null
+
+          New-Item -ItemType Directory -Force -Path `
+            "libusbk\bin\dll\x86" | Out-Null
+
+          New-Item -ItemType Directory -Force -Path `
+            "libusbk\bin\dll\amd64" | Out-Null
+
+          # --------------------------------------------------------
+          # Copy x86 driver
+          # --------------------------------------------------------
+
+          if ($x86Sys) {
+
+            Copy-Item `
+              $x86Sys.FullName `
+              "libusbk\bin\sys\x86\libusbK.sys" `
+              -Force
+
+            Write-Host "x86 libusbK.sys copied."
+          }
+
+          # --------------------------------------------------------
+          # Copy amd64 driver
+          # --------------------------------------------------------
+
+          if ($amd64Sys) {
+
+            Copy-Item `
+              $amd64Sys.FullName `
+              "libusbk\bin\sys\amd64\libusbK.sys" `
+              -Force
+
+            Write-Host "amd64 libusbK.sys copied."
+          }
+
+          # --------------------------------------------------------
+          # If architecture detection failed, try a more general
+          # fallback based on path names.
+          # --------------------------------------------------------
+
+          if (-not (Test-Path "libusbk\bin\sys\x86\libusbK.sys")) {
+
+            $fallbackX86 = $libusbKFiles |
+              Where-Object {
+                $_.FullName -match '(?i)(x86|32)'
+              } |
+              Select-Object -First 1
+
+            if ($fallbackX86) {
+
+              Copy-Item `
+                $fallbackX86.FullName `
+                "libusbk\bin\sys\x86\libusbK.sys" `
+                -Force
+
+              Write-Host "x86 driver copied using fallback detection."
+            }
+          }
+
+          if (-not (Test-Path "libusbk\bin\sys\amd64\libusbK.sys")) {
+
+            $fallbackAMD64 = $libusbKFiles |
+              Where-Object {
+                $_.FullName -match '(?i)(amd64|x64|64)'
+              } |
+              Select-Object -First 1
+
+            if ($fallbackAMD64) {
+
+              Copy-Item `
+                $fallbackAMD64.FullName `
+                "libusbk\bin\sys\amd64\libusbK.sys" `
+                -Force
+
+              Write-Host "amd64 driver copied using fallback detection."
+            }
+          }
+
+          # --------------------------------------------------------
+          # Copy DLLs
+          # --------------------------------------------------------
+
+          foreach ($dll in $libusbKDlls) {
+
+            if ($dll.FullName -match '(?i)[\\/]x86[\\/]') {
+
+              Copy-Item `
+                $dll.FullName `
+                "libusbk\bin\dll\x86\libusbK.dll" `
+                -Force
+
+              Write-Host "x86 libusbK.dll copied."
+            }
+
+            elseif ($dll.FullName -match '(?i)[\\/](amd64|x64)[\\/]') {
+
+              Copy-Item `
+                $dll.FullName `
+                "libusbk\bin\dll\amd64\libusbK.dll" `
+                -Force
+
+              Write-Host "amd64 libusbK.dll copied."
+            }
+          }
 
           # --------------------------------------------------------
           # Final validation
           # --------------------------------------------------------
 
-          $expectedLibusbK = 'libusbk\bin\sys\x86\libusbK.sys'
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "Validating normalized libusbK"
+          Write-Host "========================================"
 
-          if (-not (Test-Path $expectedLibusbK)) {
+          $requiredFiles = @(
+            "libusbk\bin\sys\x86\libusbK.sys",
+            "libusbk\bin\sys\amd64\libusbK.sys"
+          )
+
+          foreach ($required in $requiredFiles) {
+
+            if (Test-Path $required) {
+
+              Write-Host "OK: $required"
+            }
+            else {
+
+              Write-Warning "MISSING: $required"
+            }
+          }
+
+          if (-not (Test-Path "libusbk\bin\sys\x86\libusbK.sys")) {
 
             Write-Host ""
-            Write-Host "Contents of normalized libusbk directory:"
-            Write-Host ""
-
+            Write-Host "Normalized libusbK tree:"
+            
             Get-ChildItem `
               -Path libusbk `
               -Recurse `
               -File |
               Select-Object -ExpandProperty FullName
 
-            throw "Expected file not found: $expectedLibusbK"
+            throw "Unable to create normalized x86 libusbK.sys"
+          }
+
+          if (-not (Test-Path "libusbk\bin\sys\amd64\libusbK.sys")) {
+
+            Write-Host ""
+            Write-Host "Normalized libusbK tree:"
+            
+            Get-ChildItem `
+              -Path libusbk `
+              -Recurse `
+              -File |
+              Select-Object -ExpandProperty FullName
+
+            throw "Unable to create normalized amd64 libusbK.sys"
           }
 
           Write-Host ""
-          Write-Host "========================================"
-          Write-Host "libusbK layout validated successfully"
-          Write-Host "========================================"
-          Write-Host ""
-          Write-Host $expectedLibusbK
-          Write-Host ""
+          Write-Host "libusbK normalization completed successfully."
 
       # ------------------------------------------------------------
       # Add MSBuild
@@ -362,7 +503,6 @@ jobs:
 
             Write-Host `
               "This does not necessarily mean the device ID is absent."
-
           }
           else {
 
@@ -431,7 +571,6 @@ jobs:
           tag_name: wdi-simple-${{ inputs.libwdi_ref }}-${{ github.run_number }}
           name: "wdi-simple ${{ inputs.libwdi_ref }} build #${{ github.run_number }}"
           generate_release_notes: true
-
           files: |
             wdi-simple.exe
 
