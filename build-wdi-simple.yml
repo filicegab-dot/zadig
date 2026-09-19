@@ -1,0 +1,487 @@
+name: Build wdi-simple
+
+on:
+  workflow_dispatch:
+    inputs:
+      libwdi_ref:
+        description: "libwdi tag/branch/commit"
+        required: true
+        default: "v1.5.1"
+
+permissions:
+  contents: write
+
+env:
+  WDK_URL: https://go.microsoft.com/fwlink/p/?LinkID=253170
+  LIBUSB0_URL: https://github.com/mcuee/libusb-win32/releases/download/release_1.4.0.0/libusb-win32-bin-1.4.0.0.zip
+  LIBUSBK_URL: https://github.com/mcuee/libusbk/releases/download/V3.1.0.0/libusbK-3.1.0.0-bin.7z
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+
+      # ------------------------------------------------------------
+      # Checkout libwdi
+      # ------------------------------------------------------------
+      - name: Checkout libwdi
+        uses: actions/checkout@v5
+        with:
+          repository: pbatard/libwdi
+          ref: ${{ inputs.libwdi_ref }}
+          fetch-depth: 1
+
+      # ------------------------------------------------------------
+      # Download and prepare dependencies
+      # ------------------------------------------------------------
+      - name: Scarica e prepara i file di supporto
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Write-Host "========================================"
+          Write-Host "Downloading dependencies"
+          Write-Host "========================================"
+          Write-Host ""
+
+          # --------------------------------------------------------
+          # Download
+          # --------------------------------------------------------
+
+          Write-Host "Downloading WDK redistributable..."
+          Invoke-WebRequest `
+            -Uri $env:WDK_URL `
+            -OutFile wdk-redist.msi
+
+          Write-Host "Downloading libusb-win32..."
+          Invoke-WebRequest `
+            -Uri $env:LIBUSB0_URL `
+            -OutFile libusb0-redist.zip
+
+          Write-Host "Downloading libusbK..."
+          Invoke-WebRequest `
+            -Uri $env:LIBUSBK_URL `
+            -OutFile libusbk-redist.7z
+
+          # --------------------------------------------------------
+          # Create extraction directories
+          # --------------------------------------------------------
+
+          Write-Host ""
+          Write-Host "Creating extraction directories..."
+
+          New-Item -ItemType Directory -Force -Path wdk | Out-Null
+          New-Item -ItemType Directory -Force -Path libusb0-archive | Out-Null
+          New-Item -ItemType Directory -Force -Path libusbk-archive | Out-Null
+
+          # --------------------------------------------------------
+          # Extract WDK
+          # --------------------------------------------------------
+
+          Write-Host ""
+          Write-Host "Extracting WDK..."
+
+          $wdkTarget = (Resolve-Path .).Path + '\wdk'
+
+          $wdkProcess = Start-Process msiexec.exe `
+            -ArgumentList @(
+              '/a',
+              (Resolve-Path wdk-redist.msi).Path,
+              '/qn',
+              "TARGETDIR=$wdkTarget"
+            ) `
+            -Wait `
+            -NoNewWindow `
+            -PassThru
+
+          if ($wdkProcess.ExitCode -ne 0) {
+            throw "WDK extraction failed with exit code $($wdkProcess.ExitCode)"
+          }
+
+          # --------------------------------------------------------
+          # Extract libusb-win32
+          # --------------------------------------------------------
+
+          Write-Host ""
+          Write-Host "Extracting libusb-win32..."
+
+          7z x libusb0-redist.zip -olibusb0-archive -y
+
+          # --------------------------------------------------------
+          # Extract libusbK
+          # --------------------------------------------------------
+
+          Write-Host ""
+          Write-Host "Extracting libusbK..."
+
+          7z x libusbk-redist.7z -olibusk-archive -y
+
+          # --------------------------------------------------------
+          # Normalize libusb-win32
+          # --------------------------------------------------------
+
+          Write-Host ""
+          Write-Host "Normalizing libusb-win32 directory..."
+
+          $libusb0Root = Get-ChildItem `
+            -Path libusb0-archive `
+            -Directory |
+            Select-Object -First 1
+
+          if (-not $libusb0Root) {
+            throw "Could not find the extracted libusb-win32 directory"
+          }
+
+          if (Test-Path libusb0) {
+            Remove-Item libusb0 -Recurse -Force
+          }
+
+          Move-Item $libusb0Root.FullName libusb0
+
+          # --------------------------------------------------------
+          # Locate libusbK.sys
+          # --------------------------------------------------------
+
+          Write-Host ""
+          Write-Host "Searching for libusbK.sys..."
+
+          $libusbKFile = Get-ChildItem `
+            -Path libusbk-archive `
+            -Filter libusbK.sys `
+            -File `
+            -Recurse |
+            Where-Object {
+              $_.FullName -match '[\\/]bin[\\/]sys[\\/]x86[\\/]libusbK\.sys$'
+            } |
+            Select-Object -First 1
+
+          if (-not $libusbKFile) {
+
+            Write-Host ""
+            Write-Host "Files contained in libusbK archive:"
+            Write-Host ""
+
+            Get-ChildItem `
+              -Path libusbk-archive `
+              -Recurse `
+              -File |
+              Select-Object -ExpandProperty FullName
+
+            throw "The libusbK archive does not contain bin/sys/x86/libusbK.sys"
+          }
+
+          Write-Host ""
+          Write-Host "Found libusbK.sys:"
+          Write-Host $libusbKFile.FullName
+
+          # --------------------------------------------------------
+          # Find the actual libusbK root.
+          #
+          # We intentionally DO NOT assume a fixed number of
+          # parent directories.
+          #
+          # Expected structure:
+          #
+          # <root>\
+          #   bin\
+          #     sys\
+          #       x86\
+          #         libusbK.sys
+          #
+          # --------------------------------------------------------
+
+          Write-Host ""
+          Write-Host "Locating libusbK root..."
+
+          $libusbKRoot = Get-ChildItem `
+            -Path libusbk-archive `
+            -Directory `
+            -Recurse |
+            Where-Object {
+              Test-Path (
+                Join-Path $_.FullName 'bin\sys\x86\libusbK.sys'
+              )
+            } |
+            Select-Object -First 1
+
+          if (-not $libusbKRoot) {
+            throw "Could not determine the libusbK root directory"
+          }
+
+          Write-Host ""
+          Write-Host "libusbK root:"
+          Write-Host $libusbKRoot.FullName
+
+          # --------------------------------------------------------
+          # Validate expected structure
+          # --------------------------------------------------------
+
+          $expectedSource = Join-Path `
+            $libusbKRoot.FullName `
+            'bin\sys\x86\libusbK.sys'
+
+          if (-not (Test-Path $expectedSource)) {
+            throw "Invalid libusbK root: $($libusbKRoot.FullName)"
+          }
+
+          Write-Host ""
+          Write-Host "Validated:"
+          Write-Host $expectedSource
+
+          # --------------------------------------------------------
+          # Normalize libusbK directory
+          # --------------------------------------------------------
+
+          if (Test-Path libusbk) {
+            Remove-Item libusbk -Recurse -Force
+          }
+
+          Move-Item `
+            $libusbKRoot.FullName `
+            libusbk
+
+          # --------------------------------------------------------
+          # Final validation
+          # --------------------------------------------------------
+
+          $expectedLibusbK = 'libusbk\bin\sys\x86\libusbK.sys'
+
+          if (-not (Test-Path $expectedLibusbK)) {
+
+            Write-Host ""
+            Write-Host "Contents of normalized libusbk directory:"
+            Write-Host ""
+
+            Get-ChildItem `
+              -Path libusbk `
+              -Recurse `
+              -File |
+              Select-Object -ExpandProperty FullName
+
+            throw "Expected file not found: $expectedLibusbK"
+          }
+
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "libusbK layout validated successfully"
+          Write-Host "========================================"
+          Write-Host ""
+          Write-Host $expectedLibusbK
+          Write-Host ""
+
+      # ------------------------------------------------------------
+      # Add MSBuild
+      # ------------------------------------------------------------
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      # ------------------------------------------------------------
+      # Build
+      # ------------------------------------------------------------
+      - name: Build wdi-simple
+        shell: cmd
+        run: |
+          msbuild libwdi.sln ^
+            /p:Configuration=Release ^
+            /p:Platform=x64 ^
+            /m
+
+      # ------------------------------------------------------------
+      # Verify executable
+      # ------------------------------------------------------------
+      - name: Verify wdi-simple.exe
+        shell: pwsh
+        run: |
+
+          $exe = Get-ChildItem `
+            -Path . `
+            -Filter wdi-simple.exe `
+            -Recurse |
+            Select-Object -First 1
+
+          if (-not $exe) {
+            throw "wdi-simple.exe was not produced"
+          }
+
+          Write-Host ""
+          Write-Host "Found:"
+          Write-Host $exe.FullName
+
+          Write-Host ""
+          Write-Host "File information:"
+
+          Get-Item $exe.FullName |
+            Select-Object FullName, Length, LastWriteTime
+
+          Write-Host ""
+          Write-Host "Version information:"
+
+          (Get-Item $exe.FullName).VersionInfo |
+            Select-Object `
+              FileVersion,
+              ProductVersion,
+              CompanyName,
+              ProductName
+
+      # ------------------------------------------------------------
+      # Verify target hardware ID
+      # ------------------------------------------------------------
+      - name: Verify target hardware ID
+        shell: pwsh
+        run: |
+
+          $exe = Get-ChildItem `
+            -Path . `
+            -Filter wdi-simple.exe `
+            -Recurse |
+            Select-Object -First 1
+
+          if (-not $exe) {
+            throw "wdi-simple.exe not found"
+          }
+
+          Write-Host ""
+          Write-Host "Checking binary for VID_30C9 / PID_0013..."
+
+          $bytes = [System.IO.File]::ReadAllBytes(
+            $exe.FullName
+          )
+
+          $ascii = [System.Text.Encoding]::ASCII.GetString(
+            $bytes
+          )
+
+          if (
+            $ascii -notmatch 'VID_30C9' -or
+            $ascii -notmatch 'PID_0013'
+          ) {
+
+            Write-Warning `
+              "VID_30C9 / PID_0013 was not found as a plain ASCII string."
+
+            Write-Host `
+              "This does not necessarily mean the device ID is absent."
+
+          }
+          else {
+
+            Write-Host `
+              "VID_30C9 and PID_0013 found in binary."
+          }
+
+      # ------------------------------------------------------------
+      # SHA-256
+      # ------------------------------------------------------------
+      - name: Calculate SHA-256
+        id: hash
+        shell: pwsh
+        run: |
+
+          $exe = Get-ChildItem `
+            -Path . `
+            -Filter wdi-simple.exe `
+            -Recurse |
+            Select-Object -First 1
+
+          if (-not $exe) {
+            throw "wdi-simple.exe not found"
+          }
+
+          $hash = (
+            Get-FileHash `
+              $exe.FullName `
+              -Algorithm SHA256
+          ).Hash
+
+          Write-Host ""
+          Write-Host "SHA-256:"
+          Write-Host $hash
+
+          "sha256=$hash" >> $env:GITHUB_OUTPUT
+
+      # ------------------------------------------------------------
+      # Prepare release asset
+      # ------------------------------------------------------------
+      - name: Prepare release asset
+        shell: pwsh
+        run: |
+
+          $exe = Get-ChildItem `
+            -Path . `
+            -Filter wdi-simple.exe `
+            -Recurse |
+            Select-Object -First 1
+
+          if (-not $exe) {
+            throw "wdi-simple.exe not found"
+          }
+
+          Copy-Item `
+            $exe.FullName `
+            "$env:GITHUB_WORKSPACE\wdi-simple.exe" `
+            -Force
+
+      # ------------------------------------------------------------
+      # Create GitHub Release
+      # ------------------------------------------------------------
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: wdi-simple-${{ inputs.libwdi_ref }}-${{ github.run_number }}
+          name: "wdi-simple ${{ inputs.libwdi_ref }} build #${{ github.run_number }}"
+          generate_release_notes: true
+
+          files: |
+            wdi-simple.exe
+
+          body: |
+            Automated wdi-simple build.
+
+            libwdi ref: ${{ inputs.libwdi_ref }}
+
+            SHA-256:
+            ${{ steps.hash.outputs.sha256 }}
+
+            Target hardware ID:
+            VID_30C9
+            PID_0013
+
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ------------------------------------------------------------
+      # Final information
+      # ------------------------------------------------------------
+      - name: Print build information
+        shell: pwsh
+        run: |
+
+          $exe = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            'wdi-simple.exe'
+
+          if (-not (Test-Path $exe)) {
+            throw "Release asset not found"
+          }
+
+          $hash = (
+            Get-FileHash `
+              $exe `
+              -Algorithm SHA256
+          ).Hash
+
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "BUILD SUCCESSFUL"
+          Write-Host "========================================"
+          Write-Host ""
+
+          Write-Host "WDI_SIMPLE_URL:"
+          Write-Host "https://github.com/${{ github.repository }}/releases/download/wdi-simple-${{ inputs.libwdi_ref }}-${{ github.run_number }}/wdi-simple.exe"
+
+          Write-Host ""
+          Write-Host "WDI_SIMPLE_SHA256:"
+          Write-Host $hash
+
+          Write-Host ""
