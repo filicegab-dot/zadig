@@ -1,3 +1,4 @@
+
 name: Build wdi-simple
 
 on:
@@ -12,8 +13,9 @@ permissions:
   contents: write
 
 env:
-  LIBUSB0_URL: https://github.com/mcuee/libusb-win32/releases/download/release_1.4.0.0/libusb-win32-bin-1.4.0.0.zip
-  LIBUSBK_URL: https://github.com/mcuee/libusbk/releases/download/V3.1.0.0/libusbK-3.1.0.0-bin.7z
+  WDK_REDIST_URL: "https://go.microsoft.com/fwlink/p/?LinkID=253170"
+  LIBUSB0_URL: "https://github.com/mcuee/libusb-win32/releases/download/release_1.4.0.0/libusb-win32-bin-1.4.0.0.zip"
+  LIBUSBK_URL: "https://github.com/mcuee/libusbk/releases/download/V3.1.0.0/libusbK-3.1.0.0-bin.7z"
 
 jobs:
   build:
@@ -22,7 +24,7 @@ jobs:
     steps:
 
       # ============================================================
-      # Checkout libwdi
+      # CHECKOUT LIBWDI
       # ============================================================
 
       - name: Checkout libwdi
@@ -33,80 +35,158 @@ jobs:
           fetch-depth: 1
 
       # ============================================================
-      # Show installed Windows Kits
+      # INSTALL WDK 8 REDISTRIBUTABLE COMPONENTS
+      #
+      # libwdi v1.5.1 expects the legacy:
+      #
+      # C:\Program Files (x86)\Windows Kits\8.0\redist\wdf
+      #
+      # Microsoft documents LinkID=253170 as the WDK 8
+      # Redistributable Components package.
       # ============================================================
 
-      - name: Inspect Windows Kits
+      - name: Install WDK 8 redistributable components
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
 
           Write-Host "========================================"
-          Write-Host "Windows Kits installed on runner"
+          Write-Host "Installing WDK 8 Redistributable Components"
           Write-Host "========================================"
 
-          $kitsRoot = "C:\Program Files (x86)\Windows Kits"
-
-          if (-not (Test-Path $kitsRoot)) {
-              throw "Windows Kits directory not found: $kitsRoot"
-          }
-
-          Get-ChildItem $kitsRoot -Directory |
-              ForEach-Object {
-                  Write-Host $_.FullName
-              }
+          $msi = Join-Path $env:GITHUB_WORKSPACE "wdfcoinstaller.msi"
 
           Write-Host ""
-          Write-Host "Searching for WdfCoInstaller01011.dll..."
+          Write-Host "Downloading Microsoft WDK 8 redistributable package..."
 
-          $wdfCandidates = Get-ChildItem `
-              -Path $kitsRoot `
-              -Filter "WdfCoInstaller01011.dll" `
-              -File `
-              -Recurse `
-              -ErrorAction SilentlyContinue
+          Invoke-WebRequest `
+            -Uri $env:WDK_REDIST_URL `
+            -OutFile $msi
 
-          if ($wdfCandidates) {
-              $wdfCandidates |
-                  ForEach-Object {
-                      Write-Host $_.FullName
-                  }
+          if (-not (Test-Path $msi)) {
+            throw "WDK redistributable MSI was not downloaded."
           }
-          else {
-              Write-Warning "WdfCoInstaller01011.dll was not found under Windows Kits."
+
+          $size = (Get-Item $msi).Length
+
+          Write-Host ""
+          Write-Host "Downloaded MSI:"
+          Write-Host $msi
+          Write-Host "Size: $size bytes"
+
+          if ($size -lt 100000) {
+            throw "Downloaded WDK package is unexpectedly small."
+          }
+
+          # ----------------------------------------------------------
+          # Install using administrative MSI installation.
+          #
+          # TARGETDIR is deliberately the legacy Windows Kits 8.0
+          # location expected by libwdi.
+          # ----------------------------------------------------------
+
+          $targetRoot = "C:\Program Files (x86)\Windows Kits\8.0"
+
+          Write-Host ""
+          Write-Host "Installing into:"
+          Write-Host $targetRoot
+
+          $arguments = @(
+            "/a"
+            "`"$msi`""
+            "/qn"
+            "TARGETDIR=`"$targetRoot`""
+          )
+
+          $process = Start-Process `
+            -FilePath "msiexec.exe" `
+            -ArgumentList $arguments `
+            -Wait `
+            -PassThru `
+            -NoNewWindow
+
+          Write-Host ""
+          Write-Host "msiexec exit code: $($process.ExitCode)"
+
+          if ($process.ExitCode -ne 0) {
+            throw "WDK redistributable installation failed with exit code $($process.ExitCode)."
+          }
+
+          # ----------------------------------------------------------
+          # Verify WDF directory
+          # ----------------------------------------------------------
+
+          $wdfRoot = Join-Path $targetRoot "redist\wdf"
+
+          Write-Host ""
+          Write-Host "Expected WDF directory:"
+          Write-Host $wdfRoot
+
+          if (-not (Test-Path $wdfRoot)) {
+            throw "WDK 8 redist\wdf directory was not created."
           }
 
           Write-Host ""
-          Write-Host "Searching for winusbcoinstaller2.dll..."
+          Write-Host "WDF directory contents:"
 
-          $winusbCandidates = Get-ChildItem `
-              -Path $kitsRoot `
-              -Filter "winusbcoinstaller2.dll" `
-              -File `
-              -Recurse `
-              -ErrorAction SilentlyContinue
+          Get-ChildItem `
+            -Path $wdfRoot `
+            -Recurse `
+            -File |
+            Select-Object -ExpandProperty FullName
 
-          if ($winusbCandidates) {
-              $winusbCandidates |
-                  ForEach-Object {
-                      Write-Host $_.FullName
-                  }
+          # ----------------------------------------------------------
+          # Verify exact files required by libwdi
+          # ----------------------------------------------------------
+
+          $wdfX86 = Join-Path $wdfRoot "x86\WdfCoInstaller01011.dll"
+          $wdfX64 = Join-Path $wdfRoot "x64\WdfCoInstaller01011.dll"
+
+          $winusbX86 = Join-Path $wdfRoot "x86\winusbcoinstaller2.dll"
+          $winusbX64 = Join-Path $wdfRoot "x64\winusbcoinstaller2.dll"
+
+          Write-Host ""
+          Write-Host "Checking required WDF files..."
+
+          if (-not (Test-Path $wdfX86)) {
+            throw "Missing x86 WdfCoInstaller01011.dll: $wdfX86"
           }
-          else {
-              Write-Warning "winusbcoinstaller2.dll was not found under Windows Kits."
+
+          if (-not (Test-Path $wdfX64)) {
+            throw "Missing x64 WdfCoInstaller01011.dll: $wdfX64"
           }
+
+          Write-Host "OK: $wdfX86"
+          Write-Host "OK: $wdfX64"
+
+          Write-Host ""
+          Write-Host "Checking WinUSB co-installers..."
+
+          if (-not (Test-Path $winusbX86)) {
+            throw "Missing x86 winusbcoinstaller2.dll: $winusbX86"
+          }
+
+          if (-not (Test-Path $winusbX64)) {
+            throw "Missing x64 winusbcoinstaller2.dll: $winusbX64"
+          }
+
+          Write-Host "OK: $winusbX86"
+          Write-Host "OK: $winusbX64"
+
+          Write-Host ""
+          Write-Host "WDK 8 redistributable components installed successfully."
 
       # ============================================================
-      # Download and prepare libusb dependencies
+      # DOWNLOAD AND PREPARE LIBUSB-WIN32 / LIBUSBK
       # ============================================================
 
-      - name: Download and prepare dependencies
+      - name: Download and prepare libusb dependencies
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
 
           Write-Host "========================================"
-          Write-Host "Downloading dependencies"
+          Write-Host "Downloading libusb dependencies"
           Write-Host "========================================"
 
           # ----------------------------------------------------------
@@ -132,7 +212,7 @@ jobs:
             -OutFile libusbk-redist.7z
 
           # ----------------------------------------------------------
-          # Create directories
+          # Create extraction directories
           # ----------------------------------------------------------
 
           New-Item `
@@ -184,14 +264,14 @@ jobs:
             Select-Object -First 1
 
           if (-not $libusb0Root) {
-              throw "Could not find extracted libusb-win32 directory."
+            throw "Could not find extracted libusb-win32 directory."
           }
 
           if (Test-Path libusb0) {
-              Remove-Item `
-                libusb0 `
-                -Recurse `
-                -Force
+            Remove-Item `
+              libusb0 `
+              -Recurse `
+              -Force
           }
 
           Move-Item `
@@ -214,83 +294,54 @@ jobs:
 
           if (-not $libusbKFiles) {
 
-              Write-Host ""
-              Write-Host "Files contained in libusbK archive:"
+            Write-Host ""
+            Write-Host "Files contained in libusbK archive:"
 
-              Get-ChildItem `
-                -Path libusbk-archive `
-                -Recurse `
-                -File |
-                Select-Object -ExpandProperty FullName
+            Get-ChildItem `
+              -Path libusbk-archive `
+              -Recurse `
+              -File |
+              Select-Object -ExpandProperty FullName
 
-              throw "libusbK.sys not found in libusbK archive."
+            throw "libusbK.sys not found in libusbK archive."
           }
 
           Write-Host ""
           Write-Host "Found libusbK.sys:"
 
           $libusbKFiles |
-              ForEach-Object {
-                  Write-Host $_.FullName
-              }
+            ForEach-Object {
+              Write-Host $_.FullName
+            }
 
           # ----------------------------------------------------------
-          # Locate x86 / amd64 drivers
+          # Identify x86 and amd64
           # ----------------------------------------------------------
 
           $x86Sys = $libusbKFiles |
             Where-Object {
-                $_.FullName -match '(?i)[\\/]x86[\\/][^\\/]*libusbK\.sys$'
+              $_.FullName -match '(?i)[\\/]x86[\\/][^\\/]*libusbK\.sys$'
             } |
             Select-Object -First 1
 
           $amd64Sys = $libusbKFiles |
             Where-Object {
-                $_.FullName -match '(?i)[\\/](amd64|x64)[\\/][^\\/]*libusbK\.sys$'
+              $_.FullName -match '(?i)[\\/](amd64|x64)[\\/][^\\/]*libusbK\.sys$'
             } |
             Select-Object -First 1
 
-          if (-not $x86Sys) {
-              Write-Warning "x86 libusbK.sys was not detected by path."
-          }
-
-          if (-not $amd64Sys) {
-              Write-Warning "amd64 libusbK.sys was not detected by path."
-          }
-
           # ----------------------------------------------------------
-          # Locate libusbK.dll
-          # ----------------------------------------------------------
-
-          Write-Host ""
-          Write-Host "Searching for libusbK.dll..."
-
-          $libusbKDlls = Get-ChildItem `
-            -Path libusbk-archive `
-            -Filter "libusbK.dll" `
-            -File `
-            -Recurse `
-            -ErrorAction SilentlyContinue
-
-          if ($libusbKDlls) {
-              $libusbKDlls |
-                  ForEach-Object {
-                      Write-Host $_.FullName
-                  }
-          }
-
-          # ----------------------------------------------------------
-          # Create normalized libusbK directory
+          # Create normalized libusbK tree
           # ----------------------------------------------------------
 
           Write-Host ""
           Write-Host "Creating normalized libusbK directory..."
 
           if (Test-Path libusbk) {
-              Remove-Item `
-                libusbk `
-                -Recurse `
-                -Force
+            Remove-Item `
+              libusbk `
+              -Recurse `
+              -Force
           }
 
           New-Item `
@@ -318,78 +369,93 @@ jobs:
             Out-Null
 
           # ----------------------------------------------------------
-          # Copy x86 driver
+          # Copy drivers
           # ----------------------------------------------------------
 
           if ($x86Sys) {
 
-              Copy-Item `
-                $x86Sys.FullName `
-                "libusbk\bin\sys\x86\libusbK.sys" `
-                -Force
+            Copy-Item `
+              $x86Sys.FullName `
+              "libusbk\bin\sys\x86\libusbK.sys" `
+              -Force
 
-              Write-Host "Copied x86 libusbK.sys."
+            Write-Host "Copied x86 libusbK.sys."
           }
-
-          # ----------------------------------------------------------
-          # Copy amd64 driver
-          # ----------------------------------------------------------
 
           if ($amd64Sys) {
 
-              Copy-Item `
-                $amd64Sys.FullName `
-                "libusbk\bin\sys\amd64\libusbK.sys" `
-                -Force
+            Copy-Item `
+              $amd64Sys.FullName `
+              "libusbk\bin\sys\amd64\libusbK.sys" `
+              -Force
 
-              Write-Host "Copied amd64 libusbK.sys."
+            Write-Host "Copied amd64 libusbK.sys."
           }
 
           # ----------------------------------------------------------
-          # Fallback search for x86
+          # Fallback x86
           # ----------------------------------------------------------
 
           if (-not (Test-Path "libusbk\bin\sys\x86\libusbK.sys")) {
 
-              $fallbackX86 = $libusbKFiles |
-                Where-Object {
-                    $_.FullName -match '(?i)(x86|32)'
-                } |
-                Select-Object -First 1
+            $fallbackX86 = $libusbKFiles |
+              Where-Object {
+                $_.FullName -match '(?i)(x86|32)'
+              } |
+              Select-Object -First 1
 
-              if ($fallbackX86) {
+            if ($fallbackX86) {
 
-                  Copy-Item `
-                    $fallbackX86.FullName `
-                    "libusbk\bin\sys\x86\libusbK.sys" `
-                    -Force
+              Copy-Item `
+                $fallbackX86.FullName `
+                "libusbk\bin\sys\x86\libusbK.sys" `
+                -Force
 
-                  Write-Host "Copied x86 driver using fallback detection."
-              }
+              Write-Host "Copied x86 driver using fallback detection."
+            }
           }
 
           # ----------------------------------------------------------
-          # Fallback search for amd64
+          # Fallback amd64
           # ----------------------------------------------------------
 
           if (-not (Test-Path "libusbk\bin\sys\amd64\libusbK.sys")) {
 
-              $fallbackAMD64 = $libusbKFiles |
-                Where-Object {
-                    $_.FullName -match '(?i)(amd64|x64|64)'
-                } |
-                Select-Object -First 1
+            $fallbackAMD64 = $libusbKFiles |
+              Where-Object {
+                $_.FullName -match '(?i)(amd64|x64|64)'
+              } |
+              Select-Object -First 1
 
-              if ($fallbackAMD64) {
+            if ($fallbackAMD64) {
 
-                  Copy-Item `
-                    $fallbackAMD64.FullName `
-                    "libusbk\bin\sys\amd64\libusbK.sys" `
-                    -Force
+              Copy-Item `
+                $fallbackAMD64.FullName `
+                "libusbk\bin\sys\amd64\libusbK.sys" `
+                -Force
 
-                  Write-Host "Copied amd64 driver using fallback detection."
-              }
+              Write-Host "Copied amd64 driver using fallback detection."
+            }
           }
+
+          # ----------------------------------------------------------
+          # Locate DLLs
+          # ----------------------------------------------------------
+
+          Write-Host ""
+          Write-Host "Searching for libusbK.dll..."
+
+          $libusbKDlls = Get-ChildItem `
+            -Path libusbk-archive `
+            -Filter "libusbK.dll" `
+            -File `
+            -Recurse `
+            -ErrorAction SilentlyContinue
+
+          $libusbKDlls |
+            ForEach-Object {
+              Write-Host $_.FullName
+            }
 
           # ----------------------------------------------------------
           # Copy DLLs
@@ -397,273 +463,94 @@ jobs:
 
           foreach ($dll in $libusbKDlls) {
 
-              if ($dll.FullName -match '(?i)[\\/]x86[\\/]') {
+            if ($dll.FullName -match '(?i)[\\/]x86[\\/]') {
 
-                  Copy-Item `
-                    $dll.FullName `
-                    "libusbk\bin\dll\x86\libusbK.dll" `
-                    -Force
+              Copy-Item `
+                $dll.FullName `
+                "libusbk\bin\dll\x86\libusbK.dll" `
+                -Force
+            }
+            elseif ($dll.FullName -match '(?i)[\\/](amd64|x64)[\\/]') {
 
-                  Write-Host "Copied x86 libusbK.dll."
-              }
-              elseif ($dll.FullName -match '(?i)[\\/](amd64|x64)[\\/]') {
-
-                  Copy-Item `
-                    $dll.FullName `
-                    "libusbk\bin\dll\amd64\libusbK.dll" `
-                    -Force
-
-                  Write-Host "Copied amd64 libusbK.dll."
-              }
+              Copy-Item `
+                $dll.FullName `
+                "libusbk\bin\dll\amd64\libusbK.dll" `
+                -Force
+            }
           }
 
           # ----------------------------------------------------------
-          # Validate libusbK
+          # Validate
           # ----------------------------------------------------------
 
           if (-not (Test-Path "libusbk\bin\sys\x86\libusbK.sys")) {
-              throw "Normalized x86 libusbK.sys is missing."
+            throw "Normalized x86 libusbK.sys is missing."
           }
 
           if (-not (Test-Path "libusbk\bin\sys\amd64\libusbK.sys")) {
-              throw "Normalized amd64 libusbK.sys is missing."
+            throw "Normalized amd64 libusbK.sys is missing."
           }
 
           Write-Host ""
-          Write-Host "libusbK normalization completed successfully."
+          Write-Host "libusbK preparation completed successfully."
 
       # ============================================================
-      # Prepare legacy WDK 8.0 paths required by libwdi
+      # SHOW WDK PATHS USED BY LIBWDI
       # ============================================================
 
-      - name: Prepare WDK 8 WDF redistributables
+      - name: Verify libwdi dependency paths
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
 
+          $wdkRoot = "C:\Program Files (x86)\Windows Kits\8.0\redist\wdf"
+
           Write-Host "========================================"
-          Write-Host "Preparing WDF redistributables"
+          Write-Host "Verifying libwdi dependency paths"
           Write-Host "========================================"
 
-          $kitsRoot = "C:\Program Files (x86)\Windows Kits"
-
-          if (-not (Test-Path $kitsRoot)) {
-              throw "Windows Kits root not found: $kitsRoot"
-          }
-
-          # ----------------------------------------------------------
-          # libwdi v1.5.1 expects this legacy location:
-          #
-          # C:\Program Files (x86)\Windows Kits\8.0\redist\wdf\x86
-          # C:\Program Files (x86)\Windows Kits\8.0\redist\wdf\x64
-          # ----------------------------------------------------------
-
-          $legacyRoot = Join-Path `
-            $kitsRoot `
-            "8.0\redist\wdf"
-
-          $legacyX86 = Join-Path `
-            $legacyRoot `
-            "x86"
-
-          $legacyX64 = Join-Path `
-            $legacyRoot `
-            "x64"
-
-          New-Item `
-            -ItemType Directory `
-            -Force `
-            -Path $legacyX86 |
-            Out-Null
-
-          New-Item `
-            -ItemType Directory `
-            -Force `
-            -Path $legacyX64 |
-            Out-Null
-
-          # ----------------------------------------------------------
-          # Find Microsoft WDF 1.11 co-installer
-          # ----------------------------------------------------------
+          Write-Host ""
+          Write-Host "WDK:"
+          Write-Host $wdkRoot
 
           Write-Host ""
-          Write-Host "Searching Windows Kits for WDF 1.11..."
+          Write-Host "Contents:"
 
-          $wdfFiles = Get-ChildItem `
-            -Path $kitsRoot `
-            -Filter "WdfCoInstaller01011.dll" `
-            -File `
+          Get-ChildItem `
+            -Path $wdkRoot `
             -Recurse `
-            -ErrorAction SilentlyContinue
-
-          if (-not $wdfFiles) {
-              throw @"
-WdfCoInstaller01011.dll was not found anywhere below:
-
-$kitsRoot
-
-The Windows runner does not currently contain the WDF 1.11 redistributable.
-"@
-          }
+            -File |
+            Select-Object -ExpandProperty FullName
 
           Write-Host ""
-          Write-Host "WDF candidates:"
-
-          $wdfFiles |
-              ForEach-Object {
-                  Write-Host $_.FullName
-              }
-
-          # ----------------------------------------------------------
-          # Find WinUSB co-installer
-          # ----------------------------------------------------------
-
-          Write-Host ""
-          Write-Host "Searching Windows Kits for WinUSB co-installer..."
-
-          $winusbFiles = Get-ChildItem `
-            -Path $kitsRoot `
-            -Filter "winusbcoinstaller2.dll" `
-            -File `
-            -Recurse `
-            -ErrorAction SilentlyContinue
-
-          if (-not $winusbFiles) {
-              throw @"
-winusbcoinstaller2.dll was not found anywhere below:
-
-$kitsRoot
-
-The required WinUSB redistributable is missing.
-"@
-          }
-
-          Write-Host ""
-          Write-Host "WinUSB candidates:"
-
-          $winusbFiles |
-              ForEach-Object {
-                  Write-Host $_.FullName
-              }
-
-          # ----------------------------------------------------------
-          # Helper: determine architecture from path
-          # ----------------------------------------------------------
-
-          function Get-ArchitectureFromPath {
-              param(
-                  [string]$Path
-              )
-
-              if ($Path -match '(?i)[\\/]x86[\\/]') {
-                  return "x86"
-              }
-
-              if ($Path -match '(?i)[\\/](x64|amd64)[\\/]') {
-                  return "x64"
-              }
-
-              return $null
-          }
-
-          # ----------------------------------------------------------
-          # Copy WDF co-installer
-          # ----------------------------------------------------------
-
-          foreach ($file in $wdfFiles) {
-
-              $arch = Get-ArchitectureFromPath $file.FullName
-
-              if ($arch -eq "x86") {
-
-                  Copy-Item `
-                    $file.FullName `
-                    (Join-Path $legacyX86 "WdfCoInstaller01011.dll") `
-                    -Force
-
-                  Write-Host "Installed x86 WdfCoInstaller01011.dll"
-              }
-
-              elseif ($arch -eq "x64") {
-
-                  Copy-Item `
-                    $file.FullName `
-                    (Join-Path $legacyX64 "WdfCoInstaller01011.dll") `
-                    -Force
-
-                  Write-Host "Installed x64 WdfCoInstaller01011.dll"
-              }
-          }
-
-          # ----------------------------------------------------------
-          # Copy WinUSB co-installer
-          # ----------------------------------------------------------
-
-          foreach ($file in $winusbFiles) {
-
-              $arch = Get-ArchitectureFromPath $file.FullName
-
-              if ($arch -eq "x86") {
-
-                  Copy-Item `
-                    $file.FullName `
-                    (Join-Path $legacyX86 "winusbcoinstaller2.dll") `
-                    -Force
-
-                  Write-Host "Installed x86 winusbcoinstaller2.dll"
-              }
-
-              elseif ($arch -eq "x64") {
-
-                  Copy-Item `
-                    $file.FullName `
-                    (Join-Path $legacyX64 "winusbcoinstaller2.dll") `
-                    -Force
-
-                  Write-Host "Installed x64 winusbcoinstaller2.dll"
-              }
-          }
-
-          # ----------------------------------------------------------
-          # Validation
-          # ----------------------------------------------------------
-
-          Write-Host ""
-          Write-Host "Validating legacy WDK paths..."
+          Write-Host "Required WdfCoInstaller files:"
 
           $required = @(
-              (Join-Path $legacyX86 "WdfCoInstaller01011.dll"),
-              (Join-Path $legacyX64 "WdfCoInstaller01011.dll"),
-              (Join-Path $legacyX86 "winusbcoinstaller2.dll"),
-              (Join-Path $legacyX64 "winusbcoinstaller2.dll")
+            "$wdkRoot\x86\WdfCoInstaller01011.dll",
+            "$wdkRoot\x64\WdfCoInstaller01011.dll"
           )
 
           foreach ($file in $required) {
 
-              if (-not (Test-Path $file)) {
+            if (-not (Test-Path $file)) {
+              throw "Required file missing: $file"
+            }
 
-                  Write-Host ""
-                  Write-Host "ERROR: Missing:"
-                  Write-Host $file
-
-                  throw "Required WDF/WinUSB redistributable is missing."
-              }
-
-              Write-Host "OK: $file"
+            Write-Host "OK: $file"
           }
 
           Write-Host ""
-          Write-Host "WDF redistributables prepared successfully."
+          Write-Host "All libwdi dependency paths are ready."
 
       # ============================================================
-      # MSBuild
+      # MSBUILD
       # ============================================================
 
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v2
 
       # ============================================================
-      # Build libwdi
+      # BUILD
       # ============================================================
 
       - name: Build libwdi
@@ -675,12 +562,13 @@ The required WinUSB redistributable is missing.
             /m
 
       # ============================================================
-      # Locate wdi-simple.exe
+      # VERIFY OUTPUT
       # ============================================================
 
       - name: Verify wdi-simple.exe
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
 
           $exe = Get-ChildItem `
             -Path . `
@@ -690,40 +578,35 @@ The required WinUSB redistributable is missing.
             Select-Object -First 1
 
           if (-not $exe) {
-              throw "wdi-simple.exe was not produced."
+            throw "wdi-simple.exe was not produced."
           }
 
           Write-Host ""
           Write-Host "========================================"
           Write-Host "wdi-simple.exe FOUND"
           Write-Host "========================================"
-          Write-Host ""
 
+          Write-Host ""
           Write-Host "Path:"
           Write-Host $exe.FullName
 
           Write-Host ""
           Write-Host "Size:"
-          Write-Host $exe.Length
+          Write-Host "$($exe.Length) bytes"
 
           Write-Host ""
-          Write-Host "Version information:"
-
-          $exe.VersionInfo |
-            Select-Object `
-              FileVersion,
-              ProductVersion,
-              CompanyName,
-              ProductName
+          Write-Host "Version:"
+          Write-Host $exe.VersionInfo.FileVersion
 
       # ============================================================
-      # SHA-256
+      # SHA256
       # ============================================================
 
       - name: Calculate SHA-256
         id: hash
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
 
           $exe = Get-ChildItem `
             -Path . `
@@ -733,7 +616,7 @@ The required WinUSB redistributable is missing.
             Select-Object -First 1
 
           if (-not $exe) {
-              throw "wdi-simple.exe was not found."
+            throw "wdi-simple.exe was not found."
           }
 
           $hash = (
@@ -752,12 +635,13 @@ The required WinUSB redistributable is missing.
               -Append
 
       # ============================================================
-      # Copy release asset
+      # PREPARE RELEASE ASSET
       # ============================================================
 
       - name: Prepare release asset
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
 
           $exe = Get-ChildItem `
             -Path . `
@@ -767,7 +651,7 @@ The required WinUSB redistributable is missing.
             Select-Object -First 1
 
           if (-not $exe) {
-              throw "wdi-simple.exe was not found."
+            throw "wdi-simple.exe was not found."
           }
 
           Copy-Item `
@@ -776,13 +660,13 @@ The required WinUSB redistributable is missing.
             -Force
 
       # ============================================================
-      # GitHub Release
+      # CREATE GITHUB RELEASE
       # ============================================================
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: wdi-simple-${{ inputs.libwdi_ref }}-${{ github.run_number }}
+          tag_name: "wdi-simple-${{ inputs.libwdi_ref }}-${{ github.run_number }}"
           name: "wdi-simple ${{ inputs.libwdi_ref }} build #${{ github.run_number }}"
           generate_release_notes: true
 
@@ -802,16 +686,21 @@ The required WinUSB redistributable is missing.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # ============================================================
-      # Final information
+      # FINAL INFORMATION
       # ============================================================
 
       - name: Print build information
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
 
           $exe = Join-Path `
             $env:GITHUB_WORKSPACE `
             "wdi-simple.exe"
+
+          if (-not (Test-Path $exe)) {
+            throw "Release executable not found."
+          }
 
           $hash = (
             Get-FileHash `
@@ -823,8 +712,8 @@ The required WinUSB redistributable is missing.
           Write-Host "========================================"
           Write-Host "BUILD SUCCESSFUL"
           Write-Host "========================================"
-          Write-Host ""
 
+          Write-Host ""
           Write-Host "Release:"
           Write-Host "https://github.com/${{ github.repository }}/releases/tag/wdi-simple-${{ inputs.libwdi_ref }}-${{ github.run_number }}"
 
